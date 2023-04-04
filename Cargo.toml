@@ -1,6 +1,6 @@
 [package]
 name = "tokio-cron"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A simple cron scheduler for tokio"
 license = "MIT"

@@ -1,6 +1,8 @@
 use std::collections::BinaryHeap;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
+use std::panic;
+use std::panic::AssertUnwindSafe;
 use std::str::FromStr;
 use std::sync::Arc;
 use chrono::{DateTime, Local, TimeZone, Utc};
@@ -8,7 +10,8 @@ use cron::Schedule;
 use tokio::sync::Notify;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
-use tracing::{trace, info, debug};
+use tracing::{trace, info, error};
+use futures::FutureExt;
 
 type JobFunction = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -86,9 +89,13 @@ impl<Tz: TimeZone + Send + Sync + Debug + 'static> Scheduler<Tz>
                     }
                     let to_run = lock.pop().unwrap();
                     let this = to_run.dt.clone();
-                    (to_run.func)();
+                    let f = AssertUnwindSafe(to_run.func.clone());
+                    let res = panic::catch_unwind(move || f());
+                    if res.is_err() {
+                        error!(name=%to_run.name, this_dt=?this, "Cron job panicked");
+                    }
                     let next = to_run.next(inner.timezone.clone());
-                    debug!(this_dt=?this, next_dt=?next.dt, name=%next.name, "Ran job (Async job is running in background)");
+                    info!(name=%next.name, this_dt=?this, next_dt=?next.dt, "Ran job (Async job is running in background)");
                     lock.push(next);
                 }
                 let t = lock.peek().map(|s| s.dt.with_timezone(&Utc) - now).unwrap_or(DateTime::<Utc>::MAX_UTC - now);
@@ -138,7 +145,7 @@ impl<Tz: TimeZone> Ord for ScheduledJob<Tz> {
     }
 }
 
-impl std::fmt::Debug for ScheduledJob {
+impl Debug for ScheduledJob {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScheduledJob")
             .field("dt", &self.dt)
@@ -154,6 +161,24 @@ pub struct Job {
     func: JobFunction,
 }
 
+fn syncify_job<F, Fut>(name: &str, f: F) -> JobFunction
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output=()> + Send + 'static,
+{
+    let name = name.to_string();
+    Arc::new(move || {
+        let fut = f();
+        let name = name.clone();
+        tokio::spawn(async move {
+            let res = AssertUnwindSafe(fut).catch_unwind().await;
+            if res.is_err() {
+                error!(name=%name, "Cron job panicked during async execution");
+            }
+        });
+    })
+}
+
 impl Job {
     pub fn new<S, F, Fut>(cron: S, func: F) -> Self
         where
@@ -164,10 +189,7 @@ impl Job {
         Self {
             name: "".to_string(),
             cron_line: cron.into(),
-            func: Arc::new(move || {
-                let fut = func();
-                tokio::spawn(fut);
-            }),
+            func: syncify_job("", func),
         }
     }
 
@@ -193,10 +215,7 @@ impl Job {
         Self {
             name: name.to_string(),
             cron_line: cron.into(),
-            func: Arc::new(move || {
-                let fut = func();
-                tokio::spawn(fut);
-            }),
+            func: syncify_job(name, func),
         }
     }
 
@@ -334,5 +353,22 @@ mod tests {
         let result = counter.clone().load(Ordering::SeqCst);
         // Non-deterministic because we can have 1 or 2 executions of a */2 job in a 3 sec interval.
         assert!(result <= 2 && result >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_panic_doesnt_take_everything_down() {
+        let mut scheduler = Scheduler::local();
+
+        scheduler.add(Job::named_sync("causes-panic", "* * * * * * *", move || {
+            panic!("This should not take down the scheduler!");
+        }));
+
+        scheduler.add(Job::named("panics-in-async", "* * * * * * *", move || {
+            async move {
+                panic!("This should not take down the scheduler!");
+            }
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }

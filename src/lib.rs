@@ -1,16 +1,13 @@
-#![allow(unused)]
-
-use std::collections::{BinaryHeap, BTreeMap};
+use std::collections::BinaryHeap;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
-use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use chrono::{DateTime, Local, TimeZone, Utc};
 use cron::Schedule;
 use tokio::sync::Notify;
 use tokio::sync::RwLock;
-use tokio::time::{timeout, Duration};
+use tokio::time::timeout;
 use tracing::{trace, info, debug};
 
 type JobFunction = Arc<dyn Fn() + Send + Sync + 'static>;
@@ -97,7 +94,8 @@ impl<Tz: TimeZone + Send + Sync + Debug + 'static> Scheduler<Tz>
                 let t = lock.peek().map(|s| s.dt.with_timezone(&Utc) - now).unwrap_or(DateTime::<Utc>::MAX_UTC - now);
                 drop(lock);
                 trace!(sec=t.num_seconds(), "Sleep cron main loop until timeout or added job");
-                timeout(t.to_std().unwrap(), inner.notify.notified()).await;
+                // timeout returns Err() if the timeout elapses, but that's our happy path
+                let _ = timeout(t.to_std().unwrap(), inner.notify.notified()).await;
             }
         });
     }
@@ -266,7 +264,6 @@ pub fn monthly(day_spec: &str, hour_spec: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::Mutex;
 
     #[tokio::test]
     async fn it_works() {
@@ -289,9 +286,9 @@ mod tests {
         // will need to own its own data. (hence clone every time the outside closure is called)
         let c = counter.clone();
         scheduler.add(Job::new("*/2 * * * * *", move || {
-            let c = c.clone();
+            let counter = c.clone();
             async move {
-                c.fetch_add(1, Ordering::SeqCst);
+                counter.fetch_add(1, Ordering::SeqCst);
                 println!("Hello, world!");
             }
         }));
@@ -305,16 +302,19 @@ mod tests {
         scheduler.add(Job::new("*/1 * * * * *", async_func));
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let result = counter.clone().load(Ordering::SeqCst);
-        assert!(result <= 2);
+        // Non-deterministic because we can have 1 or 2 executions of a */2 job in a 3 sec interval.
+        assert!(result <= 2 && result >= 1);
     }
 
     #[tokio::test]
     async fn test_fancy() {
+        async fn async_fn_with_args(counter: Arc<AtomicUsize>) {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+
         let mut scheduler = Scheduler::local();
         let counter = Arc::new(AtomicUsize::new(0));
 
-        let c = counter.clone();
-        // Run foo every hour at 1 minute past the hour.
         scheduler.add(Job::named_sync("foo", hourly("1"), move || {
             println!("One minute into the hour!");
         }));
@@ -324,5 +324,15 @@ mod tests {
                 println!("Two minutes into the hour!");
             }
         }));
+
+        let c = counter.clone();
+        scheduler.add(Job::named("increase-counter", "*/2 * * * * * *", move || {
+            async_fn_with_args(c.clone())
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let result = counter.clone().load(Ordering::SeqCst);
+        // Non-deterministic because we can have 1 or 2 executions of a */2 job in a 3 sec interval.
+        assert!(result <= 2 && result >= 1);
     }
 }

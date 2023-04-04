@@ -24,10 +24,11 @@
 
 Why you might use it compared to alternatives:
 
-- It's roughly 200 lines of code.
+- It's roughly 200 lines of code and minimal dependencies
 - It has support for `tracing`
 
-Here is a 
+Here is a comprehensive example:
+
 ```rust
 use tokio_cron::{Scheduler, Job, daily};
 use std::sync::atomic::{AtomicUsize, Ordering};

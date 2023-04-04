@@ -147,16 +147,14 @@ mod tests {
     async fn it_works() {
         let mut scheduler = Scheduler::local();
         let counter = Arc::new(AtomicUsize::new(0));
-        {
-            let counter = counter.clone();
-            scheduler.add(Job::new("*/2 * * * * *", move || {
-                let counter = counter.clone();
-                async move {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    println!("Hello, world!");
-                }
-            }));
-        }
+        let c = counter.clone();
+        scheduler.add(Job::new("*/2 * * * * *", move || {
+            let counter = c.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                println!("Hello, world!");
+            }
+        }));
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let result = counter.clone().load(Ordering::SeqCst);
         assert!(result <= 2);

@@ -1,7 +1,7 @@
 #![allow(unused)]
 
-use std::collections::BTreeMap;
-use std::fmt::Formatter;
+use std::collections::{BinaryHeap, BTreeMap};
+use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -11,11 +11,12 @@ use cron::Schedule;
 use tokio::sync::Notify;
 use tokio::sync::RwLock;
 use tokio::time::{timeout, Duration};
+use tracing::{trace, info, debug};
 
 type JobFunction = Arc<dyn Fn() + Send + Sync + 'static>;
 
 struct InnerScheduler<T: TimeZone = Utc> {
-    scheduled_jobs: RwLock<BTreeMap<DateTime<T>, ScheduledJob>>,
+    scheduled_jobs: RwLock<BinaryHeap<ScheduledJob<T>>>,
     notify: Notify,
     timezone: T,
 }
@@ -35,14 +36,14 @@ impl Scheduler<Utc> {
     }
 }
 
-impl<Tz: TimeZone + Send + Sync + 'static> Scheduler<Tz>
+impl<Tz: TimeZone + Send + Sync + Debug + 'static> Scheduler<Tz>
     where
         Tz::Offset: Send + Sync,
 {
     pub fn new_in_timezone(tz: Tz) -> Self {
         let r = Self {
             inner: Arc::new(InnerScheduler {
-                scheduled_jobs: RwLock::new(BTreeMap::new()),
+                scheduled_jobs: RwLock::new(BinaryHeap::new()),
                 notify: Notify::new(),
                 timezone: tz,
             }),
@@ -52,17 +53,24 @@ impl<Tz: TimeZone + Send + Sync + 'static> Scheduler<Tz>
     }
 
     pub fn add(&mut self, job: Job) {
-        let scheduled_job = ScheduledJob {
-            cron: Schedule::from_str(&job.cron_line).unwrap(),
-            func: job.func,
+        let Job {
+            cron_line,
+            func,
+            name,
+        } = job;
+        let cron = Schedule::from_str(&cron_line).unwrap();
+        let job = ScheduledJob {
+            dt: cron.upcoming(self.inner.timezone.clone()).next().unwrap(),
+            cron,
+            func,
+            name,
         };
-        let dt = scheduled_job.cron.upcoming(self.inner.timezone.clone()).next().unwrap();
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            println!("Added job to queue");
+            info!(name=%job.name, cron_line=%cron_line, first_dt=?job.dt, "Added job to cron tab");
             let mut queue = inner.scheduled_jobs.write()
                 .await;
-            queue.insert(dt, scheduled_job);
+            queue.push(job);
             drop(queue);
             inner.notify.notify_one();
         });
@@ -75,50 +83,89 @@ impl<Tz: TimeZone + Send + Sync + 'static> Scheduler<Tz>
                 let mut lock = inner.scheduled_jobs.write()
                     .await;
                 let now = Utc::now();
-                while let Some((dt, _)) = lock.first_key_value() {
-                    if *dt > now {
+                while let Some(next) = lock.peek() {
+                    if next.dt > now {
                         break;
                     }
-                    let (_, to_run) = lock.pop_first().unwrap();
+                    let to_run = lock.pop().unwrap();
+                    let this = to_run.dt.clone();
                     (to_run.func)();
-                    let next = to_run.cron.upcoming(inner.timezone.clone()).next().unwrap();
-                    lock.insert(next, to_run);
+                    let next = to_run.next(inner.timezone.clone());
+                    debug!(this_dt=?this, next_dt=?next.dt, name=%next.name, "Ran job (Async job is running in background)");
+                    lock.push(next);
                 }
-                let t = lock.first_key_value().map(|(dt, _)| dt.with_timezone(&Utc) - now).unwrap_or(DateTime::<Utc>::MAX_UTC - now);
+                let t = lock.peek().map(|s| s.dt.with_timezone(&Utc) - now).unwrap_or(DateTime::<Utc>::MAX_UTC - now);
                 drop(lock);
-                println!("Waiting for {} seconds...", t.num_seconds());
+                trace!(sec=t.num_seconds(), "Sleep cron main loop until timeout or added job");
                 timeout(t.to_std().unwrap(), inner.notify.notified()).await;
             }
         });
     }
 }
 
-struct ScheduledJob {
+struct ScheduledJob<T: TimeZone = Utc> {
+    dt: DateTime<T>,
     cron: Schedule,
     func: JobFunction,
+    name: String,
+}
+
+impl<Tz: TimeZone> ScheduledJob<Tz> {
+    pub fn next(mut self, tz: Tz) -> Self {
+        self.dt = self.cron.upcoming(tz).next().unwrap();
+        self
+    }
+}
+
+impl<Tz: TimeZone> PartialEq<ScheduledJob<Tz>> for ScheduledJob<Tz> {
+    fn eq(&self, other: &Self) -> bool {
+        self.dt.eq(&other.dt)
+    }
+}
+
+impl<Tz: TimeZone> Eq for ScheduledJob<Tz> {}
+
+
+impl<Tz: TimeZone> PartialOrd<ScheduledJob<Tz>> for ScheduledJob<Tz> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// std::collections::BinaryHeap is a max-heap,
+/// so this reverses the ordering to make it a min-heap.
+impl<Tz: TimeZone> Ord for ScheduledJob<Tz> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.dt.cmp(&other.dt).reverse()
+    }
 }
 
 impl std::fmt::Debug for ScheduledJob {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScheduledJob")
+            .field("dt", &self.dt)
             .field("cron", &self.cron)
+            .field("name", &self.name)
             .finish()
     }
 }
 
 pub struct Job {
+    name: String,
     cron_line: String,
     func: JobFunction,
 }
 
 impl Job {
-    pub fn new<F, Fut>(cron: &str, func: F) -> Self
+    pub fn new<S, F, Fut>(cron: S, func: F) -> Self
         where
             F: Fn() -> Fut + Send + Sync + 'static,
-            Fut: Future<Output=()> + Send + 'static
+            Fut: Future<Output=()> + Send + 'static,
+            S: Into<String>,
     {
         Self {
-            cron_line: cron.to_string(),
+            name: "".to_string(),
+            cron_line: cron.into(),
             func: Arc::new(move || {
                 let fut = func();
                 tokio::spawn(fut);
@@ -127,14 +174,92 @@ impl Job {
     }
 
     /// Schedule a job that is not async
-    pub fn new_sync<T>(cron: &str, func: T) -> Self
+    pub fn new_sync<S, F>(cron: S, func: F) -> Self
         where
-            T: Fn() -> () + Send + Sync + 'static {
+            F: Fn() -> () + Send + Sync + 'static,
+            S: Into<String> {
         Self {
-            cron_line: cron.to_string(),
+            name: "".to_string(),
+            cron_line: cron.into(),
             func: Arc::new(func),
         }
     }
+
+    /// Useful for debugging
+    pub fn named<S, F, Fut>(name: &str, cron: S, func: F) -> Self
+        where
+            F: Fn() -> Fut + Send + Sync + 'static,
+            Fut: Future<Output=()> + Send + 'static,
+            S: Into<String>,
+    {
+        Self {
+            name: name.to_string(),
+            cron_line: cron.into(),
+            func: Arc::new(move || {
+                let fut = func();
+                tokio::spawn(fut);
+            }),
+        }
+    }
+
+    pub fn named_sync<S, F>(name: &str, cron: S, func: F) -> Self
+        where
+            F: Fn() -> () + Send + Sync + 'static,
+            S: Into<String>,
+    {
+        Self {
+            name: name.to_string(),
+            cron_line: cron.into(),
+            func: Arc::new(func),
+        }
+    }
+}
+
+/// Convenience method for creating a job that runs every **day** on the **hour_spec** provided.
+/// second,minute = 0; hour = input; day,week,month,year = *
+/// # Example
+/// ```
+/// use tokio_cron::daily;
+/// assert_eq!(daily("6"), "0 0 6 * * * *", "Run at 6am every day.");
+/// assert_eq!(daily("*/3"), "0 0 */3 * * * *", "Run at every third hour (3am, 6am, 9am, 12pm, 3pm, 6pm, 9pm, 12am) of every day.");
+///
+pub fn daily(hour_spec: &str) -> String {
+    format!("0 0 {} * * * *", hour_spec)
+}
+
+/// Convenience method for creating a job that runs every **hour** on the **minute_spec** provided.
+/// second = 0; minute = input; hour,day,week,month,year = *
+/// # Example
+/// ```
+/// use tokio_cron::hourly;
+/// assert_eq!(hourly("20"), "0 20 * * * * *", "Run at 20 minutes past the hour, every hour.");
+/// assert_eq!(hourly("*/15"), "0 */15 * * * * *", "Run at 15, 30, 45, and 0 minutes past every hour.");
+///
+pub fn hourly(minute_spec: &str) -> String {
+    format!("0 {} * * * * *", minute_spec)
+}
+
+/// Convenience method for creating a job that runs on the given days of week, at the given hour.
+/// second,minute = 0; hour,week = input; day,month,year = *
+/// # Example
+/// ```
+/// use tokio_cron::weekly;
+/// assert_eq!(weekly("Mon,Wed,Fri", "8"), "0 0 8 * * Mon,Wed,Fri *", "Run at 8am on Mon, Wed, Fri.");
+/// assert_eq!(weekly("0,6", "0"), "0 0 0 * * 0,6 *", "Run at 12am on Saturday (6) and Sunday (0). Colloquially, that's Friday and Saturday night.");
+///
+pub fn weekly(week_spec: &str, hour_spec: &str) -> String {
+    format!("0 0 {hour_spec} * * {week_spec} *")
+}
+
+/// Convenience method for creating a job that runs on the given days of week, at the given hour.
+/// second,minute = 0; hour,day = input; month,week,year = *
+/// # Example
+/// ```
+/// use tokio_cron::monthly;
+/// assert_eq!(monthly("3", "8"), "0 0 8 3 * * *", "Run on 3rd of every month at 8am.");
+///
+pub fn monthly(day_spec: &str, hour_spec: &str) -> String {
+    format!("0 0 {hour_spec} {day_spec} * * *")
 }
 
 #[cfg(test)]
@@ -145,18 +270,59 @@ mod tests {
 
     #[tokio::test]
     async fn it_works() {
+        tracing::subscriber::set_global_default(tracing_subscriber::FmtSubscriber::builder()
+            .with_max_level(tracing::Level::TRACE)
+            .finish()
+        ).unwrap();
+
+        async fn async_func() {
+            println!("Hello, world!");
+        }
+
         let mut scheduler = Scheduler::local();
         let counter = Arc::new(AtomicUsize::new(0));
+
+        // Add an async closure.
+        // Explanation on the two clones:
+        // First clone is because we need to move the counter into the closure.
+        // Second clone is because the closure executes repeatedly, and each time, the closure
+        // will need to own its own data. (hence clone every time the outside closure is called)
         let c = counter.clone();
         scheduler.add(Job::new("*/2 * * * * *", move || {
-            let counter = c.clone();
+            let c = c.clone();
             async move {
-                counter.fetch_add(1, Ordering::SeqCst);
+                c.fetch_add(1, Ordering::SeqCst);
                 println!("Hello, world!");
             }
         }));
+
+        // Add a sync task.
+        scheduler.add(Job::new_sync("*/1 * * * * *", move || {
+            println!("Hello, world!");
+        }));
+
+        // Add an async function
+        scheduler.add(Job::new("*/1 * * * * *", async_func));
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let result = counter.clone().load(Ordering::SeqCst);
         assert!(result <= 2);
+    }
+
+    #[tokio::test]
+    async fn test_fancy() {
+        let mut scheduler = Scheduler::local();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let c = counter.clone();
+        // Run foo every hour at 1 minute past the hour.
+        scheduler.add(Job::named_sync("foo", hourly("1"), move || {
+            println!("One minute into the hour!");
+        }));
+
+        scheduler.add(Job::named("foo", hourly("2"), move || {
+            async move {
+                println!("Two minutes into the hour!");
+            }
+        }));
     }
 }

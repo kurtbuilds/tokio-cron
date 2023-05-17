@@ -67,7 +67,7 @@ impl<Tz: TimeZone + Send + Sync + Debug + 'static> Scheduler<Tz>
         };
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            info!(name=%job.name, cron_line=%cron_line, first_dt=?job.dt, "Added job to cron tab");
+            info!(name=%job.name, cron_line=?cron_line, first_dt=?job.dt, "Added job to cron tab");
             let mut queue = inner.scheduled_jobs.write()
                 .await;
             queue.push(job);

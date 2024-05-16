@@ -78,8 +78,10 @@ impl<Tz: TimeZone + Send + Sync + Debug + 'static> Scheduler<Tz>
     }
 
     pub fn cancel_by_name(&mut self, name: &str) {
+        let name = name.to_string();
+        let inner = self.inner.clone();
         tokio::spawn(async move {
-            let mut queue = self.inner.scheduled_jobs.write().await;
+            let mut queue = inner.scheduled_jobs.write().await;
             queue.retain(|job| job.name != name);
         });
     }

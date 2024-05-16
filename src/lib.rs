@@ -72,7 +72,15 @@ impl<Tz: TimeZone + Send + Sync + Debug + 'static> Scheduler<Tz>
                 .await;
             queue.push(job);
             drop(queue);
+            // notify because we want to change the next wakeup time.
             inner.notify.notify_one();
+        });
+    }
+
+    pub fn cancel_by_name(&mut self, name: &str) {
+        tokio::spawn(async move {
+            let mut queue = self.inner.scheduled_jobs.write().await;
+            queue.retain(|job| job.name != name);
         });
     }
 
